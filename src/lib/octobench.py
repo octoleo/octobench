@@ -448,7 +448,8 @@ class Runner:
         if shutil.which("sysbench"):
             for label, count in [("single", 1), ("all", threads)]:
                 samples = []
-                params = {"threads": count, "prime_limit": 20000, "duration_seconds": self.config["duration"]}
+                params = {"threads": count, "thread_policy": "all-affinity" if label == "all" else "single",
+                          "prime_limit": 20000, "duration_seconds": self.config["duration"]}
                 for repeat in range(self.config["repeats"]):
                     out, _, info = self.command(["sysbench", "cpu", f"--threads={count}", "--cpu-max-prime=20000",
                                                  f"--time={self.config['duration']}", "run"],
@@ -875,6 +876,10 @@ def comparison_signature(metric: dict):
     # Physical identities vary between systems; retain workload parameters.
     for key in ["source_target", "destination_target", "port", "llc_bytes"]:
         params.pop(key, None)
+    # An all-available-CPU test has the same policy on machines with different
+    # core counts. Preserve the actual count in each report and comparison cell.
+    if metric["id"] == "cpu.sysbench.all" and params.get("thread_policy") == "all-affinity":
+        params.pop("threads", None)
     return metric["id"], metric["unit"], metric["tool_version"], json.dumps(params, sort_keys=True)
 
 
@@ -905,7 +910,9 @@ def compare(paths: list[str]) -> int:
         values = []
         for index in range(len(reports)):
             matches = group["values"].get(index, [])
-            values.append("; ".join(f"{cell(m['target'])}: {m['value']:,.3f} ({m['sample_count']} runs)" for m in matches) or "unavailable / different settings")
+            values.append("; ".join(f"{cell(m['target'])}: {m['value']:,.3f} ({m['sample_count']} runs"
+                                    + (f", {m['parameters']['threads']} threads" if 'threads' in m['parameters'] else "")
+                                    + ")" for m in matches) or "unavailable / different settings")
         lines.append(f"| {cell(metric['label'])} [{fingerprint}] | {metric['unit']} | " + " | ".join(values) + " |")
     lines += ["", "## Source runs", ""]
     for path, report in zip(paths, reports):
