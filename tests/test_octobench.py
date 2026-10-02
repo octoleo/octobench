@@ -118,7 +118,7 @@ class ComparisonTests(unittest.TestCase):
             metric['parameters']['thread_policy'] = 'all-affinity'
         second['parameters']['threads'] = 32
         self.assertEqual(bench.comparison_signature(first), bench.comparison_signature(second))
-        second = self.metric()
+        second = {**first, "parameters": dict(first["parameters"])}
         second["tool_version"] = "different"
         self.assertNotEqual(bench.comparison_signature(first), bench.comparison_signature(second))
 
