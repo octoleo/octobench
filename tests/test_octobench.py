@@ -150,6 +150,54 @@ class ComparisonTests(unittest.TestCase):
              mock.patch.object(bench, "read_text", side_effect=lambda p, default="": contents.get(str(p), default)):
             self.assertEqual(bench.effective_memory(), 800000000)
 
+    def test_cgroup_reclaimable_cache_is_available(self):
+        contents = {"/proc/self/cgroup": "0::/", "/sys/fs/cgroup/memory.max": "1000000000",
+                    "/sys/fs/cgroup/memory.current": "950000000",
+                    "/sys/fs/cgroup/memory.stat": "inactive_file 600000000\nactive_anon 300000000"}
+        with mock.patch.object(bench, "memory_info", return_value={"MemAvailable": 4000000000}), \
+             mock.patch.object(bench, "read_text", side_effect=lambda p, default="": contents.get(str(p), default)):
+            self.assertEqual(bench.effective_memory(), 650000000)
+
+
+class LauncherTests(unittest.TestCase):
+    def test_installer_installs_missing_tools_and_forwards_arguments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / 'bin'
+            binary.mkdir()
+            for command in ['dirname', 'grep', 'head']:
+                (binary / command).symlink_to('/usr/bin/' + command)
+            for command in ['gcc', 'openssl', 'lscpu', 'lsblk', 'findmnt', 'lspci', 'lsusb',
+                            'dmidecode', 'sensors', 'rsync', 'xdg-user-dir']:
+                (binary / command).symlink_to('/bin/true')
+            scripts = {
+                'fio': '#!/bin/bash\nprintf "fio-3.36\\n"\n',
+                'apt-get': '#!/bin/bash\nprintf "%s\\n" "$*" >> "$APT_LOG"\n',
+                'sudo': '#!/bin/bash\nexec "$@"\n',
+                'python3': '#!/bin/bash\nprintf "%s\\n" "$*" > "$BACKEND_LOG"\n',
+            }
+            for name, content in scripts.items():
+                path = binary / name
+                path.write_text(content)
+                path.chmod(0o755)
+            env = {**os.environ, 'PATH': str(binary), 'APT_LOG': str(root / 'apt.log'),
+                   'BACKEND_LOG': str(root / 'backend.log')}
+            env.pop('SUDO_USER', None)
+            result = subprocess.run(['/bin/bash', str(ROOT / 'src/octobench'), '--profile', 'quick'],
+                                    env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = (root / 'apt.log').read_text().splitlines()
+            self.assertEqual(commands[0], 'update')
+            self.assertTrue(commands[1].startswith('install -y python3 sysbench fio'))
+            self.assertIn('--profile quick', (root / 'backend.log').read_text())
+
+    def test_help_does_not_install_dependencies(self):
+        result = subprocess.run(['/bin/bash', str(ROOT / 'src/octobench'), '--help'],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('Installing benchmark dependencies', result.stdout)
+        self.assertIn('--compare', result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
