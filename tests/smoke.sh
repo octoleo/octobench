@@ -5,12 +5,12 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 export HOME="$TEST_DIR/home"
-mkdir -p "$HOME" "$TEST_DIR/storage with spaces"
-printf 'existing data\n' > "$TEST_DIR/storage with spaces/do-not-touch.txt"
+mkdir -p "$HOME" "$TEST_DIR/storage with spaces:and-colon"
+printf 'existing data\n' > "$TEST_DIR/storage with spaces:and-colon/do-not-touch.txt"
 
 bash "$ROOT_DIR/src/octobench" --no-install --profile quick --duration 1 \
   --repeats 1 --size-mib 16 --transfer-mib 4 --files 16 \
-  --storage "$TEST_DIR/storage with spaces" --no-auto-usb
+  --storage "$TEST_DIR/storage with spaces:and-colon" --no-auto-usb
 
 python3 - "$TEST_DIR" <<'PY'
 import csv, json, pathlib, sys, tarfile
@@ -28,7 +28,7 @@ for metric in ['cpu.sysbench.single', 'cpu.sysbench.all', 'cpu.openssl.sha256',
     assert metric in ids, (metric, data['warnings'])
 transfers = [t['transfer'] for t in data['tests'] if 'transfer' in t]
 assert len(transfers) == 6 and all(t['sha256_verified'] for t in transfers)
-assert (root / 'storage with spaces/do-not-touch.txt').read_text() == 'existing data\n'
+assert (root / 'storage with spaces:and-colon/do-not-touch.txt').read_text() == 'existing data\n'
 assert not list(root.rglob('.octobench-*'))
 assert list(csv.DictReader(reports[0].with_suffix('.csv').open()))
 assert 'Key comparison values' in reports[0].with_suffix('.md').read_text()

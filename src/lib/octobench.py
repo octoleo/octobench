@@ -273,19 +273,20 @@ class Runner:
         self.data["warnings"].append(message)
         print(f"  Warning: {message}", flush=True)
 
-    def command(self, argv, label, timeout=120, env=None, acceptable_exits=(0,)):
+    def command(self, argv, label, timeout=120, env=None, acceptable_exits=(0,), cwd=None):
         self.counter += 1
         filename = f"{self.counter:04d}_{safe_name(label)}.txt"
         log = self.raw / filename
         started = time.monotonic()
         print(f"[{self.counter:03d}] {label}", flush=True)
         info = {"label": label, "argv": argv, "raw_file": filename,
+                "working_directory": str(cwd or Path.cwd()),
                 "started_at": dt.datetime.now().astimezone().isoformat()}
         stdout, stderr = "", ""
         process = None
         try:
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True, errors="replace", env=env, start_new_session=True)
+                                       text=True, errors="replace", env=env, cwd=cwd, start_new_session=True)
             with self.lock:
                 self.active = process
             deadline = time.monotonic() + timeout
@@ -320,7 +321,7 @@ class Runner:
             with self.lock:
                 self.active = None
             info["wall_seconds"] = time.monotonic() - started
-            log.write_text(f"$ {shlex.join(argv)}\n\nSTDOUT\n{stdout}\n\nSTDERR\n{stderr}\n")
+            log.write_text(f"$ cd -- {shlex.quote(info['working_directory'])}\n$ {shlex.join(argv)}\n\nSTDOUT\n{stdout}\n\nSTDERR\n{stderr}\n")
             self.data["tests"].append(info)
         return stdout, stderr, info
 
@@ -603,11 +604,14 @@ class Runner:
             return
         filename = directory / "fio-data.bin"
         size = self.config["size_mib"] * MIB
-        common = ["fio", "--name=octobench", f"--filename={filename}", f"--size={size}",
+        # fio interprets ':' as a file-list separator. Use a fixed basename in
+        # our private working directory, so arbitrary mount/path names cannot
+        # redirect writes outside the generated dataset directory.
+        common = ["fio", "--name=octobench", f"--filename={filename.name}", f"--size={size}",
                   "--ioengine=libaio", "--direct=1", "--numjobs=1", "--group_reporting=1",
                   "--output-format=json", "--end_fsync=1", "--randrepeat=1", "--randseed=20261002"]
         out, _, info = self.command(common + ["--rw=write", "--bs=1M", "--iodepth=16"],
-                                    f"{target['id']}-fio-initialize", 1800)
+                                    f"{target['id']}-fio-initialize", 1800, cwd=directory)
         if info["status"] != "ok":
             self.warning(f"{target['id']}: direct I/O initialization failed; no cached fallback will be presented as disk performance.")
             return
@@ -631,7 +635,7 @@ class Runner:
                                  f"--runtime={self.config['duration']}", f"--ramp_time={params['ramp_seconds']}"]
                 if rw == "randrw":
                     argv.append("--rwmixread=70")
-                out, _, info = self.command(argv, f"{target['id']}-fio-{name}-{repeat + 1}", self.config["duration"] + 180)
+                out, _, info = self.command(argv, f"{target['id']}-fio-{name}-{repeat + 1}", self.config["duration"] + 180, cwd=directory)
                 if info["status"] != "ok":
                     continue
                 try:
