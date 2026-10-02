@@ -326,6 +326,11 @@ fi
 memory_mib=$(( available_bytes / 4 / 1048576 ))
 (( memory_mib <= 256 )) || memory_mib=256
 if (( memory_mib >= 16 )); then
+    # Sysbench requires a power-of-two block size. Keep the buffer within the
+    # available-memory budget after rounding down (never round an allocation up).
+    block_mib=16
+    while (( block_mib*2 <= memory_mib )); do block_mib=$(( block_mib*2 )); done
+    memory_mib="$block_mib"
     for operation in read write; do
         samples='[]'
         for (( repeat=1; repeat<=REPEATS; repeat++ )); do

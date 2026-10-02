@@ -60,6 +60,19 @@ exec /usr/bin/dd conv=sparse "${args[@]}"
         (self.binary / "rsync").unlink(missing_ok=True)
         (self.binary / "rsync").write_text('#!/bin/bash\nexec /usr/bin/rsync --sparse "$@"\n')
         (self.binary / "rsync").chmod(0o755)
+        (self.binary / "jq").unlink(missing_ok=True)
+        (self.binary / "jq").write_text('''#!/bin/bash
+if [[ -n "${OCTO_TEST_FAIL_FINAL_JQ:-}" ]]; then
+    for argument in "$@"; do
+        if [[ "$argument" == *'.finished_at='* ]]; then
+            printf 'Injected final report serialization failure\\n' >&2
+            exit 42
+        fi
+    done
+fi
+exec /usr/bin/jq "$@"
+''')
+        (self.binary / "jq").chmod(0o755)
         # Freeze the filename clock only. Monotonic/epoch timing stays real.
         (self.binary / "date").unlink(missing_ok=True)
         (self.binary / "date").write_text('''#!/bin/bash
@@ -234,6 +247,15 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(metric["value"], 20)
         self.assertTrue(any("fio" in str(metric["tool"]) for metric in report["measurements"]))
         self.assertFalse(any("latency_p99" in metric["id"] for metric in report["measurements"]))
+        fixture.assert_untouched(self)
+
+    def test_failed_final_report_serialization_still_cleans_all_owned_data(self):
+        fixture = self.fixture()
+        fixture.env["OCTO_TEST_FAIL_FINAL_JQ"] = "1"
+        result = fixture.run()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Could not save the Desktop report", result.stderr)
+        self.assertEqual(fixture.reports(), [])
         fixture.assert_untouched(self)
 
     def test_writable_usb_target_is_tested_without_touching_existing_files(self):
