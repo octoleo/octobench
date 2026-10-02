@@ -1,49 +1,497 @@
 #!/usr/bin/env bash
-# Octobench: Linux benchmark launcher. Run as your normal desktop user.
+# Octobench: run once and leave one JSON benchmark report on your Desktop.
+# Copyright (C) 2026 Octoleo contributors. SPDX-License-Identifier: GPL-3.0
+# jq filters deliberately contain literal jq variables, not shell expansion.
+# shellcheck disable=SC2016
 set -Eeuo pipefail
-
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export LC_ALL=C
-export PYTHONUNBUFFERED=1
+umask 077
 
-# Preserve the actual user's Desktop and avoid benchmarking as root when sudo
-# was used unnecessarily. Privileged inventory is collected separately.
-if [[ ${EUID} -eq 0 && -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
-    exec sudo -u "$SUDO_USER" -- bash "$ROOT_DIR/octobench" "$@"
+VERSION='1.1.0'
+DURATION=10
+REPEATS=3
+STORAGE_MIB=1024
+TRANSFER_MIB=128
+SMALL_FILES=256
+SMALL_FILE_BYTES=16384
+WORK=''
+REPORT=''
+RESULT=''
+ACTIVE_PID=''
+RUN_EXIT=0
+RUN_SECONDS=0
+TEMP_DIRS=()
+PRIVILEGE=()
+RUN_FLUSH_PATHS=()
+
+if (( $# )); then
+    printf 'Octobench takes no arguments. Run it once to create a Desktop JSON report.\n' >&2
+    exit 2
 fi
 
-install=1
-for argument in "$@"; do
-    case "$argument" in
-        --help|-h|--version|--compare|--inventory-only|--no-install) install=0 ;;
-    esac
+# No copy or installation of Octobench itself, including when Bash reads /dev/fd.
+required=(jq sysbench fio openssl lscpu lsblk findmnt lspci lsusb dmidecode sensors rsync xdg-user-dir setsid timeout)
+missing=()
+for program in "${required[@]}"; do
+    command -v "$program" >/dev/null 2>&1 || missing+=("$program")
+done
+FIO_BIN="$(command -v fio || true)"
+if [[ -n "$FIO_BIN" ]] && ! "$FIO_BIN" --version 2>/dev/null | grep '^fio-' >/dev/null; then
+    if [[ -x /usr/bin/fio ]] && /usr/bin/fio --version 2>/dev/null | grep '^fio-' >/dev/null; then
+        FIO_BIN=/usr/bin/fio
+    else
+        missing+=('fio (Flexible I/O tester)')
+    fi
+fi
+if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1; then
+    if sudo -n true 2>/dev/null || { [[ -t 0 ]] && sudo -v; }; then
+        PRIVILEGE=(sudo -n)
+    fi
+fi
+if (( ${#missing[@]} )); then
+    printf 'Installing required benchmark tools: %s\n' "${missing[*]}"
+    command -v apt-get >/dev/null 2>&1 || {
+        printf 'Automatic dependencies require Ubuntu/Debian and apt-get.\n' >&2
+        exit 2
+    }
+    install_privilege=()
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null 2>&1 || { printf 'sudo is needed to install missing tools.\n' >&2; exit 2; }
+        install_privilege=(sudo)
+    fi
+    "${install_privilege[@]}" apt-get update
+    "${install_privilege[@]}" apt-get install -y jq sysbench fio openssl pciutils usbutils dmidecode lm-sensors rsync xdg-user-dirs util-linux coreutils
+fi
+for program in "${required[@]}"; do
+    command -v "$program" >/dev/null 2>&1 || { printf 'Required tool missing: %s\n' "$program" >&2; exit 2; }
+done
+FIO_BIN="$(command -v fio)"
+if ! "$FIO_BIN" --version 2>/dev/null | grep '^fio-' >/dev/null; then
+    if [[ -x /usr/bin/fio ]] && /usr/bin/fio --version 2>/dev/null | grep '^fio-' >/dev/null; then
+        FIO_BIN=/usr/bin/fio
+    else
+        printf 'The fio command must be the Flexible I/O tester, not Python Fiona.\n' >&2
+        exit 2
+    fi
+fi
+
+# Resolve the desktop user even if this was launched through sudo.
+USER_HOME="$HOME"
+REPORT_OWNER=''
+if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [[ -n "$USER_HOME" ]] || { printf 'Cannot resolve the desktop user home.\n' >&2; exit 2; }
+    REPORT_OWNER="$SUDO_USER"
+    DESKTOP="$(sudo -u "$SUDO_USER" xdg-user-dir DESKTOP 2>/dev/null || true)"
+else
+    DESKTOP="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+fi
+if [[ -z "$DESKTOP" || "$DESKTOP" != /* || "$DESKTOP" == "$USER_HOME" ]]; then
+    DESKTOP="$USER_HOME/Desktop"
+fi
+if [[ -n "$REPORT_OWNER" ]]; then
+    sudo -u "$REPORT_OWNER" mkdir -p -- "$DESKTOP"
+else
+    mkdir -p -- "$DESKTOP"
+fi
+[[ -w "$DESKTOP" ]] || { printf 'Your Desktop is not writable: %s\n' "$DESKTOP" >&2; exit 2; }
+SYSTEM_NAME="$(hostname)"
+SAFE_NAME="$(printf '%s' "$SYSTEM_NAME" | tr -c 'A-Za-z0-9._-' '_')"
+STAMP="$(date '+%Y-%m-%d_%H-%M-%S%z')"
+RESULT="$DESKTOP/octobench_${SAFE_NAME}_${STAMP}.json"
+if [[ -e "$RESULT" ]]; then
+    RESULT="$DESKTOP/octobench_${SAFE_NAME}_${STAMP}_$$.json"
+fi
+# Install an early cleanup trap before the first temporary allocation.
+trap '[[ -z "$WORK" ]] || rm -rf -- "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/octobench.XXXXXX")"
+TEMP_DIRS+=("$WORK")
+REPORT="$WORK/report.json"
+OUT="$WORK/stdout"
+ERR="$WORK/stderr"
+STARTED="$(date --iso-8601=seconds)"
+jq -n --arg version "$VERSION" --arg name "$SYSTEM_NAME" --arg started "$STARTED" \
+    --argjson duration "$DURATION" --argjson repeats "$REPEATS" \
+    --argjson size "$STORAGE_MIB" --argjson transfer "$TRANSFER_MIB" \
+    --argjson files "$SMALL_FILES" --argjson smallbytes "$SMALL_FILE_BYTES" \
+    '{schema_version:"2.0",octobench_version:$version,system_name:$name,started_at:$started,status:"running",
+      configuration:{duration_seconds:$duration,repeats:$repeats,storage_file_mib:$size,
+                     transfer_file_mib:$transfer,small_file_count:$files,small_file_bytes:$smallbytes,
+                     source:"home filesystem",storage_targets:"home and writable mounted USB storage"},
+      inventory:{},tool_versions:{},targets:[],measurements:[],runs:[],warnings:[],
+      interpretation:["Compare matching metric IDs, versions and workload settings downstream.",
+                      "USB signalling Mbps and PCIe link rates are observations, not measured storage throughput.",
+                      "Same-filesystem move is a directory rename, not a copied-byte benchmark.",
+                      "MiB/s means 1048576 bytes per second. Missing measurements are unavailable, never zero scores.",
+                      "These measurements have no universal world rank and cannot be converted to unrelated benchmark scores."]}' > "$REPORT"
+
+update() {
+    jq "$@" "$REPORT" > "$WORK/update.json" && mv -- "$WORK/update.json" "$REPORT"
+}
+warning() {
+    printf '  %s\n' "$1" >&2
+    update --arg message "$1" '.warnings += [$message]'
+}
+stop_active() {
+    if [[ -n "$ACTIVE_PID" ]]; then
+        kill -TERM -- "-$ACTIVE_PID" 2>/dev/null || kill -TERM "$ACTIVE_PID" 2>/dev/null || true
+        # Kill any descendants that ignored TERM; never leave a workload running.
+        kill -KILL -- "-$ACTIVE_PID" 2>/dev/null || kill -KILL "$ACTIVE_PID" 2>/dev/null || true
+        wait "$ACTIVE_PID" 2>/dev/null || true
+        ACTIVE_PID=''
+    fi
+}
+finish() {
+    local status="${1:-failed}" exit_status="${2:-1}" directory
+    trap - EXIT INT TERM HUP
+    set +e
+    stop_active
+    if [[ -f "$REPORT" ]]; then
+        if update --arg status "$status" --arg finished "$(date --iso-8601=seconds)" \
+            '.status=$status | .finished_at=$finished' && (set -o noclobber; cat "$REPORT" > "$RESULT"); then
+            if [[ -n "$REPORT_OWNER" ]] && ! chown "$REPORT_OWNER" "$RESULT"; then exit_status=1; fi
+            printf '\nBenchmark report: %s\n' "$RESULT"
+        else
+            printf 'Could not save the Desktop report: %s\n' "$RESULT" >&2
+            exit_status=1
+        fi
+    fi
+    for directory in "${TEMP_DIRS[@]}"; do
+        rm -rf -- "$directory" || printf 'Could not remove temporary test directory: %s\n' "$directory" >&2
+    done
+    exit "$exit_status"
+}
+trap 'finish failed "$?"' EXIT
+trap 'warning "Interrupted; completed measurements are preserved."; finish interrupted 130' INT
+trap 'warning "Terminated; completed measurements are preserved."; finish interrupted 143' TERM HUP
+
+# Command evidence is embedded in JSON instead of separate persistent logs.
+run() {
+    local label="$1" directory="$2" begin end command_text flush_path
+    shift 2
+    printf '[Octobench] %s\n' "$label"
+    printf -v command_text '%q ' "$@"
+    begin="$(date +%s%N)"
+    (cd -- "$directory"; exec setsid --wait timeout --foreground --signal=TERM --kill-after=5 1800 "$@") > "$OUT" 2> "$ERR" &
+    ACTIVE_PID=$!
+    if wait "$ACTIVE_PID"; then RUN_EXIT=0; else RUN_EXIT=$?; fi
+    ACTIVE_PID=''
+    # Transfer callers set these local paths. Flush before recording evidence:
+    # neither JSON serialization nor its writes belong in transfer measurements.
+    if (( RUN_EXIT == 0 )); then
+        for flush_path in "${RUN_FLUSH_PATHS[@]}"; do
+            if sync -f "$flush_path" 2>> "$ERR"; then :; else RUN_EXIT=$?; break; fi
+        done
+    fi
+    end="$(date +%s%N)"
+    RUN_SECONDS="$(awk -v begin="$begin" -v end="$end" 'BEGIN {printf "%.6f", (end-begin)/1000000000}')"
+    if [[ "$label" == inventory-dmi-* ]]; then
+        sed -i '/Serial Number:/d; /UUID:/d; /Asset Tag:/d' "$OUT"
+    fi
+    update --arg label "$label" --arg command "$command_text" --arg cwd "$directory" \
+        --argjson code "$RUN_EXIT" --argjson seconds "$RUN_SECONDS" --rawfile out "$OUT" --rawfile err "$ERR" \
+        '.runs += [{label:$label,command:$command,working_directory:$cwd,exit_code:$code,
+                    elapsed_seconds:$seconds,stdout:$out,stderr:$err}]'
+    if (( RUN_EXIT )); then
+        warning "$label unavailable (exit $RUN_EXIT; evidence is in the report)."
+        return 1
+    fi
+}
+metric() {
+    local id="$1" label="$2" target="$3" unit="$4" higher="$5" samples="$6" parameters="$7" tool="$8"
+    [[ "$samples" != '[]' ]] || return 0
+    update --arg id "$id" --arg label "$label" --arg target "$target" --arg unit "$unit" \
+        --argjson higher "$higher" --argjson samples "$samples" --argjson parameters "$parameters" --arg tool "$tool" \
+        '($samples | sort) as $s | ($s|length) as $n |
+         .measurements += [{id:$id,label:$label,target:$target,unit:$unit,higher_is_better:$higher,
+          value:(if $n%2==1 then $s[($n/2|floor)] else (($s[$n/2-1]+$s[$n/2])/2) end),
+          aggregation:"median",sample_count:$n,samples:$samples,min:($s|min),max:($s|max),
+          parameters:$parameters,tool:$tool,tool_version:(.tool_versions[$tool]//"unavailable")}]'
+}
+append_sample() {
+    jq -nc --argjson samples "$1" --argjson value "$2" '$samples+[$value]'
+}
+text_inventory() {
+    local key="$1"; shift
+    if run "inventory-$key" "$WORK" "$@"; then
+        update --arg key "$key" --rawfile text "$OUT" '.inventory[$key]=$text'
+    else
+        update --arg key "$key" '.inventory[$key]={status:"unavailable"}'
+    fi
+}
+
+printf 'Octobench %s — %s\nOne run, one JSON report on your Desktop.\n' "$VERSION" "$SYSTEM_NAME"
+printf 'Testing generated data. Existing files are not moved. Each workload repeats three times.\n'
+for program in sysbench fio openssl cp mv rsync jq; do
+    binary="$program"
+    [[ "$program" != fio ]] || binary="$FIO_BIN"
+    if [[ "$program" == openssl ]]; then version="$("$binary" version)"; else version="$("$binary" --version | sed -n '1p')"; fi
+    update --arg key "$program" --arg version "$version" '.tool_versions[$key]=$version'
+done
+text_inventory os-release cat /etc/os-release
+text_inventory kernel uname -a
+text_inventory cpu lscpu -J
+text_inventory block-devices lsblk -J -b -o NAME,KNAME,PATH,TYPE,SIZE,MODEL,TRAN,ROTA,FSTYPE,MOUNTPOINTS,MAJ:MIN
+if jq -e '.runs[-1].stdout | fromjson | .blockdevices' "$REPORT" > "$WORK/disks.json" 2>/dev/null; then
+    update --slurpfile disks "$WORK/disks.json" '.inventory.block_devices=$disks[0]'
+else
+    printf '[]\n' > "$WORK/disks.json"
+fi
+text_inventory pci-links lspci -vv
+text_inventory usb-tree lsusb -t
+text_inventory sensors sensors -j
+text_inventory memory cat /proc/meminfo
+text_inventory load cat /proc/loadavg
+text_inventory cgroup cat /proc/self/cgroup
+for kind in baseboard memory processor; do
+    text_inventory "dmi-$kind" "${PRIVILEGE[@]}" dmidecode --type "$kind"
+done
+THREADS="$(nproc)"
+update --argjson count "$THREADS" '.inventory.available_cpu_threads=$count'
+
+update '.inventory.usb_devices=[] | .inventory.pci_devices=[] | .inventory.cpu_power_policies=[] | .inventory.power_supplies=[]'
+for directory in /sys/bus/usb/devices/*; do
+    [[ -r "$directory/speed" ]] || continue
+    update --arg port "${directory##*/}" --arg speed "$(cat "$directory/speed")" \
+        --arg product "$(cat "$directory/product" 2>/dev/null || true)" \
+        '.inventory.usb_devices += [{port:$port,negotiated_mbps:($speed|tonumber?),product:$product}]'
+done
+for directory in /sys/bus/pci/devices/*; do
+    [[ -r "$directory/current_link_speed" ]] || continue
+    update --arg address "${directory##*/}" --arg speed "$(cat "$directory/current_link_speed")" \
+        --arg width "$(cat "$directory/current_link_width")" \
+        --arg maxspeed "$(cat "$directory/max_link_speed")" --arg maxwidth "$(cat "$directory/max_link_width")" \
+        '.inventory.pci_devices += [{address:$address,current_speed:$speed,current_lanes:$width,supported_speed:$maxspeed,supported_lanes:$maxwidth}]'
+done
+for directory in /sys/devices/system/cpu/cpufreq/policy*; do
+    [[ -r "$directory/scaling_governor" ]] || continue
+    update --arg policy "${directory##*/}" --arg governor "$(cat "$directory/scaling_governor")" \
+        --arg driver "$(cat "$directory/scaling_driver")" \
+        --arg frequency "$(cat "$directory/scaling_cur_freq" 2>/dev/null || true)" \
+        --arg preference "$(cat "$directory/energy_performance_preference" 2>/dev/null || true)" \
+        '.inventory.cpu_power_policies += [{policy:$policy,governor:$governor,driver:$driver,current_frequency_khz:$frequency,energy_preference:$preference}]'
+done
+for directory in /sys/class/power_supply/*; do
+    [[ -d "$directory" ]] || continue
+    update --arg name "${directory##*/}" --arg type "$(cat "$directory/type" 2>/dev/null || true)" \
+        --arg status "$(cat "$directory/status" 2>/dev/null || true)" \
+        --arg online "$(cat "$directory/online" 2>/dev/null || true)" \
+        --arg capacity "$(cat "$directory/capacity" 2>/dev/null || true)" \
+        '.inventory.power_supplies += [{name:$name,type:$type,status:$status,online:$online,capacity_percent:$capacity}]'
 done
 
-if (( install )); then
-    commands=(python3 sysbench fio gcc openssl lscpu lsblk findmnt lspci lsusb dmidecode sensors rsync xdg-user-dir)
-    missing=()
-    for command_name in "${commands[@]}"; do
-        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+for mode in single all; do
+    count=1
+    [[ "$mode" != all ]] || count="$THREADS"
+    samples='[]'
+    for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+        if run "cpu-$mode-$repeat" "$WORK" sysbench cpu "--threads=$count" --cpu-max-prime=20000 "--time=$DURATION" run; then
+            value="$(awk '/events per second:/ {print $NF}' "$OUT")"
+            if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then samples="$(append_sample "$samples" "$value")"; else warning 'CPU result could not be parsed.'; fi
+        fi
     done
-    # Some environments have the unrelated Fiona CLI named fio.
-    if command -v fio >/dev/null 2>&1 && ! fio --version 2>/dev/null | head -n 1 | grep -q '^fio-'; then
-        missing+=("fio (Flexible I/O tester)")
-    fi
-    if (( ${#missing[@]} )); then
-        printf 'Installing benchmark dependencies (missing: %s)\n' "${missing[*]}"
-        if ! command -v apt-get >/dev/null 2>&1; then
-            printf 'Automatic installation supports Ubuntu/Debian. Install the dependencies listed in README.md, then use --no-install.\n' >&2
-            exit 2
+    parameters="$(jq -nc --arg mode "$mode" --argjson threads "$count" --argjson duration "$DURATION" '{thread_policy:$mode,threads:$threads,prime_limit:20000,duration_seconds:$duration}')"
+    metric "cpu.sysbench.$mode" "CPU $mode-thread prime workload" system events/s true "$samples" "$parameters" sysbench
+done
+for algorithm in sha256 aes-256-gcm; do
+    samples='[]'
+    args=(openssl speed -elapsed -seconds "$DURATION" -bytes 16384 -evp "$algorithm" -mr)
+    [[ "$algorithm" != aes-256-gcm ]] || args+=(-aead)
+    for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+        if run "crypto-$algorithm-$repeat" "$WORK" "${args[@]}"; then
+            value="$(awk -F: '/^\+F:/ {printf "%.6f", $NF/1048576}' "$OUT" "$ERR")"
+            if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then samples="$(append_sample "$samples" "$value")"; else warning 'OpenSSL result could not be parsed.'; fi
         fi
-        privilege=()
-        if (( EUID != 0 )); then
-            command -v sudo >/dev/null 2>&1 || { printf 'Install sudo or install dependencies as root.\n' >&2; exit 2; }
-            privilege=(sudo)
-        fi
-        "${privilege[@]}" apt-get update
-        "${privilege[@]}" apt-get install -y python3 sysbench fio gcc openssl pciutils usbutils dmidecode lm-sensors rsync xdg-user-dirs util-linux coreutils
+    done
+    parameters="$(jq -nc --argjson duration "$DURATION" '{threads:1,block_bytes:16384,duration_seconds:$duration,elapsed_time:true}')"
+    metric "cpu.openssl.$algorithm" "OpenSSL $algorithm throughput" system MiB/s true "$samples" "$parameters" openssl
+done
+
+# This is a memory-access workload, including CPU/cache effects, not STREAM.
+available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+available_bytes=$(( ${available_kib:-0} * 1024 ))
+if [[ -r /sys/fs/cgroup/memory.max && -r /sys/fs/cgroup/memory.current ]]; then
+    limit="$(cat /sys/fs/cgroup/memory.max)"
+    if [[ "$limit" =~ ^[0-9]+$ ]]; then
+        used="$(cat /sys/fs/cgroup/memory.current)"
+        reclaimable="$(awk '$1=="inactive_file" {print $2}' /sys/fs/cgroup/memory.stat)"
+        remaining=$(( limit - used + ${reclaimable:-0} ))
+        (( remaining >= 0 )) || remaining=0
+        (( remaining <= limit )) || remaining="$limit"
+        (( available_bytes <= remaining )) || available_bytes="$remaining"
     fi
 fi
+memory_mib=$(( available_bytes / 4 / 1048576 ))
+(( memory_mib <= 256 )) || memory_mib=256
+if (( memory_mib >= 16 )); then
+    for operation in read write; do
+        samples='[]'
+        for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+            if run "memory-$operation-$repeat" "$WORK" sysbench memory --threads=1 "--memory-block-size=${memory_mib}M" \
+                --memory-total-size=1T "--memory-oper=$operation" --memory-access-mode=seq "--time=$DURATION" run; then
+                value="$(sed -n 's/.*(\([0-9.]*\) MiB\/sec).*/\1/p' "$OUT")"
+                if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then samples="$(append_sample "$samples" "$value")"; else warning 'Memory result could not be parsed.'; fi
+            fi
+        done
+        parameters="$(jq -nc --argjson block "$memory_mib" --argjson duration "$DURATION" \
+            '{threads:1,block_mib:$block,duration_seconds:$duration,access:"sequential",total_transfer_limit:"1T",note:"CPU and cache also affect this memory-access workload"}')"
+        metric "memory.sysbench.$operation" "Sequential memory $operation access" system MiB/s true "$samples" "$parameters" sysbench
+    done
+else
+    warning 'Memory workloads skipped: insufficient available memory within detected limits.'
+fi
 
-command -v python3 >/dev/null 2>&1 || { printf 'Python 3.10+ is required.\n' >&2; exit 2; }
-exec python3 "$ROOT_DIR/lib/octobench.py" "$@"
+flush_tree() {
+    sync -f "$1"
+}
+manifest() {
+    (cd -- "$1"; find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$2"
+}
+create_dataset() {
+    local path="$1" kind="$2" index
+    mkdir -p -- "$path/nested"
+    if [[ "$kind" == large ]]; then
+        dd if=/dev/urandom of="$path/nested/large.bin" bs=1M count="$TRANSFER_MIB" status=none
+        dd if=/dev/urandom of="$path/.hidden" bs=1K count=1 status=none
+    else
+        for (( index=0; index<SMALL_FILES; index++ )); do
+            dd if=/dev/urandom of="$path/nested/.file-$index" bs="$SMALL_FILE_BYTES" count=1 status=none
+        done
+    fi
+    flush_tree "$path"
+}
+transfer() {
+    local target="$1" source_root="$2" destination_root="$3" mode="$4" kind="$5" operation="$6"
+    local repeat source destination seconds='[]' rates='[]' elapsed bytes parameters
+    local -a RUN_FLUSH_PATHS=()
+    if [[ "$kind" == large ]]; then bytes=$(( TRANSFER_MIB*1048576+1024 )); else bytes=$(( SMALL_FILES*SMALL_FILE_BYTES )); fi
+    for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+        source="$source_root/source-$mode-$kind-$operation-$repeat"
+        destination="$destination_root/destination-$mode-$kind-$operation-$repeat"
+        create_dataset "$source" "$kind"
+        manifest "$source" "$WORK/source.sha256"
+        case "$operation" in
+            cp) args=(cp -a --reflink=never -- "$source" "$destination") ;;
+            rsync) args=(rsync -a --whole-file -- "$source/" "$destination/") ;;
+            mv) args=(mv -- "$source" "$destination") ;;
+        esac
+        RUN_FLUSH_PATHS=("$destination")
+        [[ "$operation" != mv ]] || RUN_FLUSH_PATHS+=("$source_root")
+        if run "transfer-$target-$mode-$kind-$operation-$repeat" "$WORK" "${args[@]}"; then
+            elapsed="$RUN_SECONDS"
+            manifest "$destination" "$WORK/destination.sha256"
+            if cmp -s "$WORK/source.sha256" "$WORK/destination.sha256" && { [[ "$operation" != mv ]] || [[ ! -e "$source" ]]; }; then
+                seconds="$(append_sample "$seconds" "$elapsed")"
+                if [[ "$operation" != mv || "$mode" == cross ]]; then
+                    value="$(awk -v bytes="$bytes" -v seconds="$elapsed" 'BEGIN {if(seconds>0) printf "%.6f", bytes/1048576/seconds}')"
+                    [[ -z "$value" ]] || rates="$(append_sample "$rates" "$value")"
+                fi
+            else
+                warning "Transfer verification failed: $target/$mode/$kind/$operation. No performance value recorded."
+            fi
+        fi
+        rm -rf -- "$source" "$destination"
+    done
+    parameters="$(jq -nc --arg mode "$mode" --arg kind "$kind" --arg operation "$operation" --argjson bytes "$bytes" \
+        '{operation:$operation,dataset:$kind,filesystem_mode:$mode,bytes:$bytes,verification:"SHA-256 outside timed interval",verified:true,flush_in_timing:true,
+          source_cache:"buffered; no global cache dropping",flush_scope:"syncfs target filesystem, including any other dirty data",reflinks:false,
+          source_direction:(if $mode=="cross" then "home to target" else "within target" end)}')"
+    metric "transfer.$operation.$mode.$kind.seconds" "$operation $mode-filesystem $kind-file time" "$target" s false "$seconds" "$parameters" "$operation"
+    metric "transfer.$operation.$mode.$kind.rate" "$operation $mode-filesystem $kind-file throughput" "$target" MiB/s true "$rates" "$parameters" "$operation"
+}
+
+jq -r 'def mounts($transport): .[] | (.tran // $transport) as $t |
+    (if $t=="usb" then (.mountpoints[]? | select(.!=null)) else empty end),
+    ((.children // []) | mounts($t)); mounts(null)' "$WORK/disks.json" > "$WORK/usb-mounts.txt"
+printf '%s\n' "$USER_HOME" > "$WORK/targets.txt"
+cat "$WORK/usb-mounts.txt" >> "$WORK/targets.txt"
+source_temp=''
+target_index=0
+while IFS= read -r directory; do
+    [[ -d "$directory" && -w "$directory" ]] || continue
+    if grep -Fxq -- "$directory" "$WORK/seen-targets.txt" 2>/dev/null; then continue; fi
+    printf '%s\n' "$directory" >> "$WORK/seen-targets.txt"
+    target_index=$(( target_index+1 ))
+    target="target$target_index"
+    free_bytes="$(df -B1 --output=avail "$directory" | tail -n 1 | tr -d ' ')"
+    needed=$(( STORAGE_MIB*1048576 + 2*TRANSFER_MIB*1048576 + 1073741824 ))
+    if (( free_bytes < needed )); then
+        update --arg id "$target" --arg path "$directory" '.targets += [{id:$id,directory:$path,status:"skipped-insufficient-space"}]'
+        warning "Storage and transfers skipped on $directory: insufficient free space including 1 GiB reserve."
+        continue
+    fi
+    target_temp="$(mktemp -d "$directory/.octobench.XXXXXX")"
+    TEMP_DIRS+=("$target_temp")
+    mount='{}'
+    if run "mount-$target" "$WORK" findmnt -J -T "$directory" -o TARGET,SOURCE,FSTYPE,OPTIONS,MAJ:MIN; then
+        mount="$(jq -c '.filesystems[0] // {}' "$OUT")"
+    fi
+    update --arg id "$target" --arg path "$directory" --argjson mount "$mount" --argjson free "$free_bytes" \
+        '.targets += [{id:$id,directory:$path,mount:$mount,free_bytes_at_start:$free,status:"running"}]'
+    fstype="$(jq -r '.fstype // "unknown"' <<< "$mount")"
+    case "$fstype" in tmpfs|ramfs|overlay|aufs|nfs|nfs4|cifs|fuse.sshfs) warning "$directory uses $fstype: results measure this filesystem path, not isolated physical disk performance." ;; esac
+    common=("$FIO_BIN" --name=octobench --filename=fio-data.bin "--size=${STORAGE_MIB}M" --ioengine=libaio --direct=1
+        --numjobs=1 --group_reporting=1 --output-format=json --end_fsync=1 --randrepeat=1 --randseed=20261002)
+    if run "fio-$target-initialize" "$target_temp" "${common[@]}" --rw=write --bs=1M --iodepth=16 && jq -e '.jobs | length==1 and .[0].error==0' "$OUT" >/dev/null; then
+        for workload in seq_read seq_write rand_read_qd1 rand_read_qd32 rand_write_qd32 mixed_qd32; do
+            case "$workload" in
+                seq_read) rw='read'; block=1M; depth=16; directions=(read) ;;
+                seq_write) rw='write'; block=1M; depth=16; directions=(write) ;;
+                rand_read_qd1) rw=randread; block=4k; depth=1; directions=(read) ;;
+                rand_read_qd32) rw=randread; block=4k; depth=32; directions=(read) ;;
+                rand_write_qd32) rw=randwrite; block=4k; depth=32; directions=(write) ;;
+                mixed_qd32) rw=randrw; block=4k; depth=32; directions=(read write) ;;
+            esac
+            printf '[]\n' > "$WORK/fio-samples.json"
+            for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+                args=("${common[@]}" "--rw=$rw" "--bs=$block" "--iodepth=$depth" --time_based=1 "--runtime=$DURATION" --ramp_time=3)
+                [[ "$rw" != randrw ]] || args+=(--rwmixread=70)
+                if run "fio-$target-$workload-$repeat" "$target_temp" "${args[@]}"; then
+                    if jq -e '.jobs | length==1 and .[0].error==0' "$OUT" >/dev/null; then
+                        jq -s '.[0]+[.[1].jobs[0]]' "$WORK/fio-samples.json" "$OUT" > "$WORK/fio-next.json"
+                        mv -- "$WORK/fio-next.json" "$WORK/fio-samples.json"
+                    else warning 'fio returned invalid JSON or an I/O error; no value recorded.'; fi
+                fi
+            done
+            parameters="$(jq -nc --arg rw "$rw" --arg block "$block" --argjson depth "$depth" --argjson size "$STORAGE_MIB" --argjson duration "$DURATION" \
+                '{rw:$rw,block_size:$block,queue_depth:$depth,jobs:1,direct_io:true,file_size_mib:$size,duration_seconds:$duration,ramp_seconds:3,
+                  engine:"libaio",end_fsync:true,read_mix_percent:(if $rw=="randrw" then 70 else null end)}')"
+            for direction in "${directions[@]}"; do
+                for measurement in bandwidth iops latency_mean latency_p99; do
+                    unit=MiB/s; higher=true
+                    case "$measurement" in
+                        bandwidth) expression='(if .bw_bytes!=null then .bw_bytes/1048576 elif .bw!=null then .bw/1024 else null end)' ;;
+                        iops) unit=IOPS; expression='.iops' ;;
+                        latency_mean) unit=us; higher=false; expression='(if .clat_ns.mean!=null then .clat_ns.mean/1000 else .clat_us.mean end)' ;;
+                        latency_p99) unit=us; higher=false; expression='(if .clat_ns.percentile["99.000000"]!=null then .clat_ns.percentile["99.000000"]/1000 else .clat_us.percentile["99.000000"] end)' ;;
+                    esac
+                    samples="$(jq -c --arg direction "$direction" '[.[] | .[$direction] | '"$expression"' | select(type=="number")]' "$WORK/fio-samples.json")"
+                    metric "storage.fio.$workload.$direction.$measurement" "fio $workload $direction $measurement" "$target" "$unit" "$higher" "$samples" "$parameters" fio
+                done
+            done
+        done
+    else
+        warning "Direct-I/O storage initialization failed on $directory; no cached fallback is used."
+    fi
+    rm -f -- "$target_temp/fio-data.bin"
+    for kind in large small; do
+        for operation in cp rsync mv; do transfer "$target" "$target_temp" "$target_temp" same "$kind" "$operation"; done
+    done
+    if [[ "$(stat -c %d "$USER_HOME")" != "$(stat -c %d "$directory")" ]]; then
+        home_free="$(df -B1 --output=avail "$USER_HOME" | tail -n 1 | tr -d ' ')"
+        if (( home_free > TRANSFER_MIB*1048576 + 1073741824 )); then
+            if [[ -z "$source_temp" ]]; then source_temp="$(mktemp -d "$USER_HOME/.octobench.XXXXXX")"; TEMP_DIRS+=("$source_temp"); fi
+            for kind in large small; do
+                for operation in cp rsync mv; do transfer "$target" "$source_temp" "$target_temp" cross "$kind" "$operation"; done
+            done
+        else warning 'Cross-filesystem transfers skipped: insufficient free space in home.'; fi
+    fi
+    update --arg id "$target" '(.targets[] | select(.id==$id) | .status)="finished"'
+done < "$WORK/targets.txt"
+text_inventory sensors-after sensors -j
+text_inventory load-after cat /proc/loadavg
+status=completed
+if [[ "$(jq '.warnings | length' "$REPORT")" != 0 ]]; then status=completed-with-warnings; fi
+finish "$status" 0
