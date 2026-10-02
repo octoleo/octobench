@@ -30,6 +30,10 @@ if name == "sysbench":
             value = samples[(count - 1) % len(samples)]
         print(f"CPU speed:\n    events per second: {value}\nLatency (ms):\n         avg: 0.81")
     else:
+        size = next((a.split("=", 1)[1] for a in args if a.startswith("--memory-block-size=")), "256M")
+        block = int(size[:-1]) if size.endswith("M") else int(size)
+        if block <= 0 or block & (block - 1):
+            raise SystemExit(f"FATAL: Invalid value for memory-block-size: {size}")
         print("10240.00 MiB transferred (6789.12 MiB/sec)\nTotal operations: 10000 (10000.00 per second)")
 elif name == "fio":
     if "--version" in args:

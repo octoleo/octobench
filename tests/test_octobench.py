@@ -73,6 +73,24 @@ fi
 exec /usr/bin/jq "$@"
 ''')
         (self.binary / "jq").chmod(0o755)
+        (self.binary / "awk").unlink(missing_ok=True)
+        (self.binary / "awk").write_text('''#!/bin/bash
+if [[ -n "${OCTO_TEST_ADAPTIVE_MEMORY:-}" && "$*" == *'MemAvailable:'* && "$*" == *'/proc/meminfo'* ]]; then
+    printf '786432\\n'
+    exit 0
+fi
+exec /usr/bin/awk "$@"
+''')
+        (self.binary / "awk").chmod(0o755)
+        (self.binary / "cat").unlink(missing_ok=True)
+        (self.binary / "cat").write_text('''#!/bin/bash
+if [[ -n "${OCTO_TEST_ADAPTIVE_MEMORY:-}" && "$*" == '/sys/fs/cgroup/memory.max' ]]; then
+    printf 'max\\n'
+    exit 0
+fi
+exec /usr/bin/cat "$@"
+''')
+        (self.binary / "cat").chmod(0o755)
         # Freeze the filename clock only. Monotonic/epoch timing stays real.
         (self.binary / "date").unlink(missing_ok=True)
         (self.binary / "date").write_text('''#!/bin/bash
@@ -247,6 +265,18 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(metric["value"], 20)
         self.assertTrue(any("fio" in str(metric["tool"]) for metric in report["measurements"]))
         self.assertFalse(any("latency_p99" in metric["id"] for metric in report["measurements"]))
+        fixture.assert_untouched(self)
+
+    def test_adaptive_memory_allocation_rounds_down_to_valid_power_of_two(self):
+        fixture = self.fixture()
+        fixture.env["OCTO_TEST_ADAPTIVE_MEMORY"] = "1"
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(fixture.reports()[0].read_text())
+        memory = [metric for metric in report["measurements"] if metric["id"].startswith("memory.sysbench.")]
+        self.assertEqual(len(memory), 2)
+        for metric in memory:
+            self.assertEqual(metric["parameters"]["block_mib"], 128)
         fixture.assert_untouched(self)
 
     def test_failed_final_report_serialization_still_cleans_all_owned_data(self):
