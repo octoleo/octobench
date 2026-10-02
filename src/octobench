@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Octobench: Linux benchmark launcher. Run as your normal desktop user.
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export LC_ALL=C
+export PYTHONUNBUFFERED=1
+
+# Preserve the actual user's Desktop and avoid benchmarking as root when sudo
+# was used unnecessarily. Privileged inventory is collected separately.
+if [[ ${EUID} -eq 0 && -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
+    exec sudo -u "$SUDO_USER" -- bash "$ROOT_DIR/octobench" "$@"
+fi
+
+install=1
+for argument in "$@"; do
+    case "$argument" in
+        --help|-h|--version|--compare|--inventory-only|--no-install) install=0 ;;
+    esac
+done
+
+if (( install )); then
+    commands=(python3 sysbench fio gcc openssl lscpu lsblk findmnt lspci lsusb dmidecode sensors rsync xdg-user-dir)
+    missing=()
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    # Some environments have the unrelated Fiona CLI named fio.
+    if command -v fio >/dev/null 2>&1 && ! fio --version 2>/dev/null | head -n 1 | grep -q '^fio-'; then
+        missing+=("fio (Flexible I/O tester)")
+    fi
+    if (( ${#missing[@]} )); then
+        printf 'Installing benchmark dependencies (missing: %s)\n' "${missing[*]}"
+        if ! command -v apt-get >/dev/null 2>&1; then
+            printf 'Automatic installation supports Ubuntu/Debian. Install the dependencies listed in README.md, then use --no-install.\n' >&2
+            exit 2
+        fi
+        privilege=()
+        if (( EUID != 0 )); then
+            command -v sudo >/dev/null 2>&1 || { printf 'Install sudo or install dependencies as root.\n' >&2; exit 2; }
+            privilege=(sudo)
+        fi
+        "${privilege[@]}" apt-get update
+        "${privilege[@]}" apt-get install -y python3 sysbench fio gcc openssl pciutils usbutils dmidecode lm-sensors rsync xdg-user-dirs util-linux coreutils
+    fi
+fi
+
+command -v python3 >/dev/null 2>&1 || { printf 'Python 3.10+ is required.\n' >&2; exit 2; }
+exec python3 "$ROOT_DIR/lib/octobench.py" "$@"
