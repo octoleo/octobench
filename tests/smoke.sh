@@ -42,6 +42,33 @@ PY
 bash "$ROOT_DIR/src/octobench" --compare "$HOME/Desktop/"*.json "$TEST_DIR/peer.json"
 test -n "$(find "$HOME/Desktop" -maxdepth 1 -name 'octobench_comparison_*.md' -print -quit)"
 
+# A distinct tmpfs mount exercises copy/delete move behavior without needing
+# removable hardware. These are functional checks, not disk-performance claims.
+CROSS_DIR=""
+if [[ -d /dev/shm && -w /dev/shm ]] && python3 - <<'PY'
+import os, shutil
+raise SystemExit(0 if os.stat(os.environ['HOME']).st_dev != os.stat('/dev/shm').st_dev and shutil.disk_usage('/dev/shm').free > 2 * 1024**3 else 1)
+PY
+then
+    CROSS_DIR="$(mktemp -d /dev/shm/octobench-test.XXXXXX)"
+    trap 'rm -rf -- "$TEST_DIR"; [[ -z "$CROSS_DIR" ]] || rm -rf -- "$CROSS_DIR"' EXIT
+    bash "$ROOT_DIR/src/octobench" --no-install --profile quick --duration 1 \
+      --repeats 1 --transfer-mib 4 --files 16 --size-mib 16 --skip-cpu --skip-memory \
+      --skip-storage --storage "$CROSS_DIR" --no-auto-usb
+    python3 - "$HOME/Desktop" <<'PY'
+import json, pathlib, sys
+reports = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob('octobench_*.json')]
+data = next(d for d in reports if any(m['id'] == 'transfer.mv.cross.large.rate' for m in d['metrics']))
+assert data['targets'][0]['filesystem_class'] == 'memory-backed'
+cross = [t['transfer'] for t in data['tests'] if '-cross-' in t['label'] and 'transfer' in t]
+assert len(cross) == 6 and all(t['sha256_verified'] for t in cross)
+assert not list(pathlib.Path(data['targets'][0]['directory']).glob('.octobench-*'))
+print('Cross-filesystem verified transfer checks passed.')
+PY
+    rm -rf -- "$CROSS_DIR"
+    CROSS_DIR=""
+fi
+
 # SIGTERM must terminate an active benchmark, clean datasets, and save a report.
 export HOME="$TEST_DIR/interrupted-home"
 mkdir -p "$HOME"

@@ -84,14 +84,20 @@ def effective_memory() -> int:
             for root in roots:
                 limit = number(read_text(root / "memory.max"))
                 used = number(read_text(root / "memory.current"))
+                stats = dict(line.split(maxsplit=1) for line in read_text(root / "memory.stat").splitlines()
+                             if len(line.split()) == 2)
+                reclaimable = number(stats.get("inactive_file", "0"))
                 if limit:
-                    available = min(available, max(0, limit - used))
+                    available = min(available, max(0, min(limit, limit - used + reclaimable)))
         elif "memory" in parts[1].split(","):
             root = Path("/sys/fs/cgroup/memory") / parts[2].lstrip("/")
             limit = number(read_text(root / "memory.limit_in_bytes"))
             used = number(read_text(root / "memory.usage_in_bytes"))
+            stats = dict(line.split(maxsplit=1) for line in read_text(root / "memory.stat").splitlines()
+                         if len(line.split()) == 2)
+            reclaimable = number(stats.get("total_inactive_file", stats.get("inactive_file", "0")))
             if limit:
-                available = min(available, max(0, limit - used))
+                available = min(available, max(0, min(limit, limit - used + reclaimable)))
     return available
 
 
@@ -574,7 +580,14 @@ class Runner:
                       "kind": kind, "mount": mount, "device": disk, "backing_device": backing,
                       "usb_link": usb_link, "free_bytes_at_start": shutil.disk_usage(directory).free,
                       "filesystem_device_id": directory.stat().st_dev}
+            fstype = mount.get("fstype", "unknown")
+            target["filesystem_class"] = ("memory-backed" if fstype in {"tmpfs", "ramfs"} else
+                                          "virtual-or-overlay" if fstype in {"overlay", "aufs"} else
+                                          "network" if fstype in {"nfs", "nfs4", "cifs", "smb3", "fuse.sshfs"} else
+                                          "other")
             self.data["targets"].append(target)
+            if target["filesystem_class"] in {"memory-backed", "virtual-or-overlay", "network"}:
+                self.warning(f"{directory}: {target['filesystem_class']} filesystem ({fstype}); results describe this filesystem path, not isolated physical disk performance.")
             if usb_link:
                 self.metric("usb.negotiated_link", "USB negotiated signalling rate", [usb_link["speed_mbps"]],
                             "Mbps", {"port": usb_link["port"], "measurement": "sysfs negotiated signalling rate"},

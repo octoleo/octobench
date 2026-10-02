@@ -288,6 +288,9 @@ scores, and a theoretical USB maximum is not a world ranking.
   motherboards have several links, not one overall bus-speed number.
 - Missing hardware details, unsupported I/O, failed verification, or skipped tests
   are reported as unavailable, never as zero performance.
+- RAM-backed, overlay/container, and common network filesystems are identified
+  explicitly. Their results describe that filesystem path; they are not isolated
+  physical disk measurements.
 
 ## Dependencies and supported systems
 
